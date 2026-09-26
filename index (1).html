@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Vaporweave — Magic Wand AR</title>
+<style>
+  /* ---------- Base theme: dark futuristic gradient, neon accents ---------- */
+  :root{
+    --bg-0:#080a16; --bg-1:#141033; --panel:#12142beb;
+    --line:#31355c; --text:#f0f1ff; --sub:#9aa0d0;
+    --cyan:#5df1ff; --violet:#9b6bff; --pink:#ff6ec9; --gold:#ffd873;
+  }
+  *{ box-sizing:border-box; }
+  html,body{ height:100%; margin:0; }
+  body{
+    font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+    background:radial-gradient(circle at 15% 0%, var(--bg-1), var(--bg-0) 65%);
+    color:var(--text); overflow:hidden;
+  }
+
+  /* ---------- Fullscreen stage ---------- */
+  #stage{ position:fixed; inset:0; }
+  #video{
+    position:absolute; inset:0; width:100%; height:100%; object-fit:cover;
+    transform:scaleX(-1); /* mirror the feed so it feels like a mirror */
+  }
+  #fx{ position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+
+  /* ---------- Top-left status HUD ---------- */
+  #hud{
+    position:absolute; top:16px; left:16px; z-index:5;
+    background:var(--panel); border:1px solid var(--line); border-radius:16px;
+    padding:12px 16px; backdrop-filter:blur(10px);
+    display:flex; flex-direction:column; gap:6px; font-size:13px;
+    box-shadow:0 10px 30px #00000055;
+  }
+  .stat{ display:flex; align-items:center; gap:8px; }
+  .dot{ width:8px; height:8px; border-radius:50%; background:#565a86; flex:none; transition:.2s; }
+  .dot.on{ background:var(--cyan); box-shadow:0 0 8px var(--cyan); }
+  .dot.hot{ background:var(--pink); box-shadow:0 0 10px var(--pink); }
+  .stat b{ color:var(--sub); font-weight:600; min-width:118px; display:inline-block; }
+
+  /* ---------- Start / permission overlay ---------- */
+  #overlay{
+    position:absolute; inset:0; z-index:10; display:flex; align-items:center; justify-content:center;
+    background:linear-gradient(180deg,#080a16dd,#080a16f5); text-align:center; padding:24px;
+  }
+  #overlay.hidden{ display:none; }
+  #overlay h1{
+    font-size:clamp(28px,5vw,44px); margin:0 0 8px; font-weight:800; letter-spacing:-0.02em;
+    background:linear-gradient(90deg,var(--cyan),var(--violet) 55%,var(--pink));
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+  }
+  #overlay p{ color:var(--sub); max-width:420px; margin:0 auto 22px; font-size:14px; line-height:1.5; }
+  .start-btn{
+    border:none; cursor:pointer; padding:15px 34px; border-radius:999px;
+    font-size:16px; font-weight:700; color:#0a0b18;
+    background:linear-gradient(90deg,var(--cyan),var(--violet));
+    box-shadow:0 10px 28px #5df1ff44;
+  }
+  .start-btn:active{ transform:scale(.97); }
+  .spinner{
+    width:36px; height:36px; margin:0 auto 18px; border-radius:50%;
+    border:3px solid #ffffff22; border-top-color:var(--cyan); animation:spin 1s linear infinite;
+  }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+
+  /* ---------- Bottom hint bar ---------- */
+  #hint{
+    position:absolute; bottom:18px; left:50%; transform:translateX(-50%); z-index:5;
+    background:var(--panel); border:1px solid var(--line); border-radius:999px;
+    padding:10px 20px; font-size:13px; color:var(--sub); white-space:nowrap;
+    max-width:92vw; overflow:hidden; text-overflow:ellipsis;
+  }
+
+  @media (max-width:520px){
+    #hud{ font-size:11.5px; padding:10px 12px; }
+    .stat b{ min-width:96px; }
+  }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="fx"></canvas>
+
+  <!-- Status HUD -->
+  <div id="hud">
+    <div class="stat"><span class="dot" id="dotCamera"></span><b>Camera</b><span id="txtCamera">Off</span></div>
+    <div class="stat"><span class="dot" id="dotHand"></span><b>Hand</b><span id="txtHand">Not detected</span></div>
+    <div class="stat"><span class="dot" id="dotMouth"></span><b>Mouth</b><span id="txtMouth">Closed</span></div>
+    <div class="stat"><span class="dot" id="dotNear"></span><b>Wand near mouth</b><span id="txtNear">No</span></div>
+    <div class="stat"><span class="dot" id="dotBlow"></span><b>Blow</b><span id="txtBlow">Waiting</span></div>
+  </div>
+
+  <div id="hint">Hold your thumb and index finger apart, bring the glowing wand tip to your mouth, and blow.</div>
+
+  <!-- Start / permission overlay -->
+  <div id="overlay">
+    <div id="overlayBody">
+      <h1>Vaporweave</h1>
+      <p>A fictional AR magic wand. Camera and microphone are used only in this tab, processed entirely on your
+         device — nothing is ever recorded, saved, or uploaded.</p>
+      <button class="start-btn" id="startBtn">Start</button>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+/* =========================================================================
+   Vaporweave — AR "magic vapor wand"
+   - MediaPipe Tasks Vision (HandLandmarker + FaceLandmarker) for tracking
+   - Web Audio API for local, on-device blow (breath) detection via RMS
+   - Canvas 2D for the wand + magical particle rendering
+   No data ever leaves the browser: no uploads, no recording, no backend.
+   ======================================================================= */
+
+import { FilesetResolver, HandLandmarker, FaceLandmarker }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm";
+
+// ---- DOM handles -----------------------------------------------------
+const video = document.getElementById('video');
+const canvas = document.getElementById('fx');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const overlayBody = document.getElementById('overlayBody');
+const startBtn = document.getElementById('startBtn');
+const hud = {
+  camera:[document.getElementById('dotCamera'), document.getElementById('txtCamera')],
+  hand:[document.getElementById('dotHand'), document.getElementById('txtHand')],
+  mouth:[document.getElementById('dotMouth'), document.getElementById('txtMouth')],
+  near:[document.getElementById('dotNear'), document.getElementById('txtNear')],
+  blow:[document.getElementById('dotBlow'), document.getElementById('txtBlow')],
+};
+
+function setHud(key, text, mode){ // mode: '' | 'on' | 'hot'
+  const [dot, span] = hud[key];
+  span.textContent = text;
+  dot.className = 'dot' + (mode==='hot' ? ' hot' : mode==='on' ? ' on' : '');
+}
+
+// ---- State -------------------------------------------------------------
+let camStream = null, micStream = null;
+let handLandmarker = null, faceLandmarker = null;
+let rafId = null;
+let audioCtx = null, analyser = null, audioData = null;
+
+let smoothedWand = null;     // smoothed {x,y,angle} of wand midpoint
+let smoothedMouth = null;    // smoothed {x,y}
+let mouthOpen = false;
+let wandNearMouth = false;
+let blowing = false;
+let lastBlowTime = -Infinity;
+const BLOW_COOLDOWN_MS = 1400;     // one blow shouldn't spam dozens of bursts
+let particles = [];
+
+// ---- Start button: browsers require a user gesture before camera/mic ---
+startBtn.onclick = start;
+
+async function start(){
+  overlayBody.innerHTML = `<div class="spinner"></div><p>Requesting camera & microphone…</p>`;
+
+  // 1) Camera permission
+  try{
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: { width:1280, height:720, facingMode:'user' }, audio:false
+    });
+  }catch(err){
+    showPermissionError('camera', () => start());
+    return;
+  }
+  video.srcObject = camStream;
+  await video.play();
+  resizeCanvas();
+  setHud('camera', 'Ready', 'on');
+
+  // 2) Microphone permission (processed locally only — see setupAudio())
+  try{
+    micStream = await navigator.mediaDevices.getUserMedia({ audio:true, video:false });
+    setupAudio(micStream);
+  }catch(err){
+    // Mic is optional to the visuals working at all — degrade gracefully:
+    // blow detection just stays "Waiting" forever if denied.
+    setHud('blow', 'Mic permission denied', '');
+  }
+
+  // 3) Load MediaPipe hand + face models from CDN (all inference runs
+  //    on-device in WASM/WebGL — no frames are ever sent anywhere).
+  try{
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions:{ modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task" },
+      numHands:1, runningMode:'VIDEO'
+    });
+    faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+      baseOptions:{ modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" },
+      numFaces:1, runningMode:'VIDEO'
+    });
+  }catch(err){
+    overlayBody.innerHTML = `<p>Hand/face tracking models failed to load (needs network access to the
+      model CDN). Check your connection and try again.</p><button class="start-btn" id="retry">Try Again</button>`;
+    document.getElementById('retry').onclick = start;
+    return;
+  }
+
+  overlay.classList.add('hidden');
+  window.addEventListener('resize', resizeCanvas);
+  loop();
+}
+
+function showPermissionError(kind, retry){
+  overlayBody.innerHTML = `<h1>Vaporweave</h1>
+    <p>${kind === 'camera' ? 'Camera' : 'Microphone'} access was blocked. This experience needs it to track your
+    hand/face and detect a blow. Please allow access in your browser's site settings, then try again.</p>
+    <button class="start-btn" id="retry">Try Again</button>`;
+  document.getElementById('retry').onclick = retry;
+}
+
+function resizeCanvas(){
+  canvas.width = video.videoWidth || window.innerWidth;
+  canvas.height = video.videoHeight || window.innerHeight;
+}
+
+// ---- Local microphone analysis (RMS-based "blow" detector) -------------
+// Nothing here records, buffers persistently, or transmits audio — a single
+// AnalyserNode reads the live waveform each frame purely to estimate volume.
+function setupAudio(stream){
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const source = audioCtx.createMediaStreamSource(stream);
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 512;
+  audioData = new Uint8Array(analyser.fftSize);
+  source.connect(analyser);
+}
+
+function getMicRMS(){
+  if (!analyser) return 0;
+  analyser.getByteTimeDomainData(audioData);
+  let sumSquares = 0;
+  for (let i=0;i<audioData.length;i++){
+    const v = (audioData[i]-128)/128; // center around 0
+    sumSquares += v*v;
+  }
+  return Math.sqrt(sumSquares/audioData.length);
+}
+
+// ---- Smoothing helper (exponential moving average) to kill jitter ------
+function smooth(prev, next, factor){
+  if (!prev) return { ...next };
+  const out = {};
+  for (const k in next) out[k] = prev[k] + (next[k]-prev[k])*factor;
+  return out;
+}
+
+function dist(a,b){ return (a && b) ? Math.hypot(a.x-b.x, a.y-b.y) : Infinity; }
+
+// ---- Main loop -----------------------------------------------------------
+let lastVideoTime = -1;
+function loop(){
+  rafId = requestAnimationFrame(loop);
+  if (video.readyState < 2 || video.currentTime === lastVideoTime) { drawParticlesOnly(); return; }
+  lastVideoTime = video.currentTime;
+  const now = performance.now();
+
+  const handResult = handLandmarker.detectForVideo(video, now);
+  const faceResult = faceLandmarker.detectForVideo(video, now);
+
+  const w = canvas.width, h = canvas.height;
+  let rawWand = null, rawMouth = null, rawMouthOpen = false;
+
+  // --- Hand: thumb tip (4) and index tip (8) define the wand ---
+  if (handResult.landmarks && handResult.landmarks.length){
+    const lm = handResult.landmarks[0];
+    const thumb = lm[4], index = lm[8];
+    // mirror the x coordinate to match the mirrored video
+    const tx = (1-thumb.x)*w, ty = thumb.y*h;
+    const ix = (1-index.x)*w, iy = index.y*h;
+    rawWand = {
+      x:(tx+ix)/2, y:(ty+iy)/2,
+      angle: Math.atan2(iy-ty, ix-tx),
+      spread: Math.hypot(ix-tx, iy-ty),
+      tipX: ix, tipY: iy
+    };
+    setHud('hand', 'Detected', 'on');
+  } else {
+    setHud('hand', 'Not detected', '');
+  }
+
+  // --- Face: mouth corners/lips define position + open amount ---
+  if (faceResult.faceLandmarks && faceResult.faceLandmarks.length){
+    const lm = faceResult.faceLandmarks[0];
+    const top = lm[13], bottom = lm[14], left = lm[61], right = lm[291];
+    const cx = (1-((left.x+right.x)/2))*w, cy = ((top.y+bottom.y)/2)*h;
+    const openAmt = Math.hypot((top.x-bottom.x)*w, (top.y-bottom.y)*h);
+    rawMouth = { x:cx, y:cy };
+    rawMouthOpen = openAmt > h*0.032;
+  }
+
+  // --- Smooth tracked points to stop jitter ---
+  smoothedWand = rawWand ? smooth(smoothedWand, rawWand, 0.35) : smoothedWand;
+  smoothedMouth = rawMouth ? smooth(smoothedMouth, rawMouth, 0.35) : smoothedMouth;
+  if (!rawWand) smoothedWand = null;
+  if (!rawMouth) smoothedMouth = null;
+
+  mouthOpen = rawMouthOpen;
+  setHud('mouth', mouthOpen ? 'Open' : 'Closed', mouthOpen ? 'on' : '');
+
+  // --- Proximity: wand tip close to mouth? ---
+  wandNearMouth = smoothedWand && smoothedMouth &&
+    dist({x:smoothedWand.tipX, y:smoothedWand.tipY}, smoothedMouth) < w*0.11;
+  setHud('near', wandNearMouth ? 'Yes' : 'No', wandNearMouth ? 'on' : '');
+
+  // --- Blow detection (RMS threshold) + cooldown ---
+  const rms = getMicRMS();
+  const blowThreshold = 0.10;
+  const canBlowAgain = (now - lastBlowTime) > BLOW_COOLDOWN_MS;
+  blowing = rms > blowThreshold;
+  setHud('blow', blowing ? 'Detected' : 'Waiting', blowing ? 'hot' : '');
+
+  if (wandNearMouth && mouthOpen && blowing && canBlowAgain){
+    lastBlowTime = now;
+    burstMagicVapor(smoothedMouth.x, smoothedMouth.y);
+  }
+
+  drawFrame();
+}
+
+// A lightweight path for frames where the video hasn't advanced yet
+// (keeps particle animation smooth even if detection is momentarily idle).
+function drawParticlesOnly(){ drawFrame(); }
+
+// ---- Wand + particle rendering -----------------------------------------
+function drawFrame(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  if (smoothedWand){
+    drawWand(smoothedWand);
+  }
+
+  // update & draw particles
+  particles.forEach(p=>{
+    p.x += p.vx; p.y += p.vy;
+    p.vy -= p.buoy;                      // gentle upward drift
+    p.swirl += p.swirlSpeed;
+    p.x += Math.cos(p.swirl)*p.turbulence;
+    p.vx *= 0.98; p.vy *= 0.985;
+    p.r += p.grow;
+    p.life--;
+    const t = Math.max(p.life/p.maxLife, 0);
+    ctx.globalAlpha = t*p.baseAlpha;
+    p.draw(ctx, p, t);
+  });
+  ctx.globalAlpha = 1;
+  particles = particles.filter(p=>p.life>0);
+  if (particles.length > 400) particles.splice(0, particles.length-400);
+}
+
+function drawWand(w){
+  const len = 96, tipX = w.x + Math.cos(w.angle)*len*0.55;
+  const tipY = w.y + Math.sin(w.angle)*len*0.55;
+  const baseX = w.x - Math.cos(w.angle)*len*0.45;
+  const baseY = w.y - Math.sin(w.angle)*len*0.45;
+
+  // wand shaft — glowing gradient stick
+  const grad = ctx.createLinearGradient(baseX, baseY, tipX, tipY);
+  grad.addColorStop(0, '#7d5bd6');
+  grad.addColorStop(1, '#5df1ff');
+  ctx.strokeStyle = grad;
+  ctx.lineWidth = 7;
+  ctx.lineCap = 'round';
+  ctx.shadowColor = '#8ce8ff';
+  ctx.shadowBlur = 14;
+  ctx.beginPath(); ctx.moveTo(baseX, baseY); ctx.lineTo(tipX, tipY); ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // glowing star tip (fictional magic sparkle, not an ember)
+  const pulse = 1 + Math.sin(performance.now()/180)*0.15;
+  ctx.save();
+  ctx.translate(tipX, tipY);
+  ctx.rotate(performance.now()/900);
+  drawStar(ctx, 0, 0, 5, 10*pulse, 4*pulse, '#ffe9a8', '#ff9ee0');
+  ctx.restore();
+
+  // faint ambient sparkle trail near the tip
+  if (Math.random() < 0.6) makeSparkle(particles, tipX, tipY, true);
+}
+
+function drawStar(ctx,cx,cy,spikes,outerR,innerR,colorA,colorB){
+  const grad = ctx.createRadialGradient(cx,cy,0,cx,cy,outerR);
+  grad.addColorStop(0, colorA); grad.addColorStop(1, colorB);
+  ctx.fillStyle = grad;
+  ctx.shadowColor = colorA; ctx.shadowBlur = 18;
+  ctx.beginPath();
+  for (let i=0;i<spikes*2;i++){
+    const r = i%2===0 ? outerR : innerR;
+    const a = (Math.PI/spikes)*i - Math.PI/2;
+    const x = cx+Math.cos(a)*r, y = cy+Math.sin(a)*r;
+    i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+  }
+  ctx.closePath(); ctx.fill();
+  ctx.shadowBlur = 0;
+}
+
+// ---- The magical burst triggered by "wand near mouth" + blow ----------
+function burstMagicVapor(x,y){
+  const count = 90;
+  for (let i=0;i<count;i++){
+    const roll = Math.random();
+    if (roll < 0.4) makeMist(particles, x, y);
+    else if (roll < 0.65) makeBubble(particles, x, y);
+    else if (roll < 0.85) makeSparkle(particles, x, y, false);
+    else makeStarBit(particles, x, y);
+  }
+}
+
+function rand(a,b){ return a + Math.random()*(b-a); }
+
+// Colorful glowing mist — swirling, expanding, fading (NOT smoke-colored)
+function makeMist(arr,x,y){
+  const hue = rand(190,320);
+  arr.push({
+    x:x+rand(-14,14), y:y+rand(-10,10), vx:rand(-1.2,1.2), vy:rand(-2.2,-1.0),
+    buoy:0.01, swirl:rand(0,6.28), swirlSpeed:rand(0.03,0.08), turbulence:rand(0.4,1.1),
+    r:rand(10,22), grow:rand(0.25,0.5), life:rand(55,90), maxLife:90, baseAlpha:0.5, hue,
+    draw(ctx,p,t){
+      const g = ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,p.r);
+      g.addColorStop(0, `hsla(${p.hue},100%,75%,${0.55*t})`);
+      g.addColorStop(1, `hsla(${p.hue},100%,60%,0)`);
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,7); ctx.fill();
+    }
+  });
+}
+// Glowing bubbles that drift and pop with a soft ring
+function makeBubble(arr,x,y){
+  arr.push({
+    x:x+rand(-16,16), y:y+rand(-10,10), vx:rand(-0.8,0.8), vy:rand(-2.6,-1.4),
+    buoy:0.015, swirl:rand(0,6.28), swirlSpeed:rand(0.02,0.05), turbulence:rand(0.2,0.6),
+    r:rand(5,13), grow:0.02, life:rand(45,80), maxLife:80, baseAlpha:0.85,
+    draw(ctx,p,t){
+      ctx.strokeStyle = `rgba(140,235,255,${0.9*t})`;
+      ctx.fillStyle = `rgba(200,245,255,${0.18*t})`;
+      ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,7); ctx.fill(); ctx.stroke();
+    }
+  });
+}
+// Tiny bright sparkles
+function makeSparkle(arr,x,y,ambient){
+  arr.push({
+    x:x+rand(-18,18), y:y+rand(-18,18), vx:rand(-1.4,1.4), vy:rand(-2.2,0.1),
+    buoy:0, swirl:0, swirlSpeed:0, turbulence:0,
+    r:rand(1.4,3.2), grow:0, life:rand(ambient?10:22, ambient?22:40),
+    maxLife:40, baseAlpha:1, hue:rand(35,60),
+    draw(ctx,p,t){
+      ctx.fillStyle = `hsla(${p.hue},100%,75%,${t})`;
+      ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,7); ctx.fill();
+    }
+  });
+}
+// Small 4-point star bits for extra flourish
+function makeStarBit(arr,x,y){
+  arr.push({
+    x:x+rand(-14,14), y:y+rand(-14,14), vx:rand(-1.6,1.6), vy:rand(-2.6,-0.6),
+    buoy:0.008, swirl:rand(0,6.28), swirlSpeed:rand(0.05,0.1), turbulence:rand(0.3,0.8),
+    r:rand(3,6), grow:0, life:rand(30,55), maxLife:55, baseAlpha:0.95, hue:rand(260,330),
+    draw(ctx,p,t){
+      ctx.save();
+      ctx.translate(p.x,p.y); ctx.rotate(p.swirl);
+      ctx.fillStyle = `hsla(${p.hue},100%,78%,${t})`;
+      ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = 8;
+      ctx.beginPath();
+      for (let i=0;i<8;i++){
+        const r = i%2===0 ? p.r : p.r*0.35;
+        const a = (Math.PI/4)*i;
+        const px = Math.cos(a)*r, py = Math.sin(a)*r;
+        i===0 ? ctx.moveTo(px,py) : ctx.lineTo(px,py);
+      }
+      ctx.closePath(); ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.restore();
+    }
+  });
+}
+
+// ---- Cleanup on unload: always stop camera/mic streams -----------------
+window.addEventListener('beforeunload', ()=>{
+  if (rafId) cancelAnimationFrame(rafId);
+  if (camStream) camStream.getTracks().forEach(t=>t.stop());
+  if (micStream) micStream.getTracks().forEach(t=>t.stop());
+  if (audioCtx) audioCtx.close();
+});
+</script>
+</body>
+</html>
